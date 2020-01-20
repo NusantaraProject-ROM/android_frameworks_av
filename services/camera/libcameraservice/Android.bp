@@ -12,9 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-soong_namespace {
-}
-
 //
 // libcameraservice
 //
@@ -110,7 +107,6 @@ cc_library_shared {
         "android.hardware.camera.device@3.3",
         "android.hardware.camera.device@3.4",
         "android.hardware.camera.device@3.5",
-        "vendor.lineage.camera.motor@1.0",
     ],
 
     export_shared_lib_headers: [
@@ -145,6 +141,10 @@ cc_library_shared {
             uses_qti_camera_device: {
                 cppflags: ["-DQTI_CAMERA_DEVICE"],
                 shared_libs: ["vendor.qti.hardware.camera.device@1.0"],
+            },
+            uses_motorized_camera: {
+                cppflags: ["-DMOTORIZED_CAMERA_DEVICE"],
+                shared_libs: ["vendor.lineage.camera.motor@1.0",],
             },
         },
     },
