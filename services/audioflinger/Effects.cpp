@@ -55,6 +55,9 @@
 
 namespace android {
 
+static const effect_uuid_t IID_VISUALIZER = {0x1d0a1a53, 0x7d5d, 0x48f2, 0x8e71, {0x27,
+                                             0xfb, 0xd1, 0x0d, 0x84, 0x2c}};
+
 // ----------------------------------------------------------------------------
 //  EffectModule implementation
 // ----------------------------------------------------------------------------
@@ -108,7 +111,8 @@ AudioFlinger::EffectModule::EffectModule(ThreadBase *thread,
         goto Error;
     }
 
-    setOffloaded(thread->type() == ThreadBase::OFFLOAD, thread->id());
+    setOffloaded((thread->type() == ThreadBase::OFFLOAD || thread->type() == ThreadBase::DIRECT),
+                 thread->id());
     ALOGV("Constructor success name %s, Interface %p", mDescriptor.name, mEffectInterface.get());
 
     return;
@@ -1219,9 +1223,12 @@ status_t AudioFlinger::EffectModule::setVolume(uint32_t *left, uint32_t *right, 
 void AudioFlinger::EffectChain::setVolumeForOutput_l(uint32_t left, uint32_t right)
 {
     sp<ThreadBase> thread = mThread.promote();
+    // for offload or direct thread, if the effect chain has non-offloadable
+    // effect and any effect module within the chain has volume control, then
+    // volume control is delegated to effect, otherwise, set volume to hal.
     if (thread != 0 &&
         (thread->type() == ThreadBase::OFFLOAD || thread->type() == ThreadBase::DIRECT) &&
-        !isNonOffloadableEnabled_l()) {
+        !(isNonOffloadableEnabled_l() && hasVolumeControlEnabled_l())) {
         PlaybackThread *t = (PlaybackThread *)thread.get();
         float vol_l = (float)left / (1 << 24);
         float vol_r = (float)right / (1 << 24);
@@ -1651,18 +1658,27 @@ status_t AudioFlinger::EffectHandle::enable()
         mEnabled = false;
     } else {
         if (thread != 0) {
-            if (thread->type() == ThreadBase::OFFLOAD || thread->type() == ThreadBase::MMAP) {
+            if (thread->type() == ThreadBase::OFFLOAD ||
+                thread->type() == ThreadBase::MMAP ||
+                thread->type() == ThreadBase::DIRECT) {
                 Mutex::Autolock _l(thread->mLock);
                 thread->broadcast_l();
             }
             if (!effect->isOffloadable()) {
-                if (thread->type() == ThreadBase::OFFLOAD) {
+                if (thread->type() == ThreadBase::OFFLOAD ||
+                    thread->type() == ThreadBase::DIRECT) {
                     PlaybackThread *t = (PlaybackThread *)thread.get();
                     t->invalidateTracks(AUDIO_STREAM_MUSIC);
                 }
                 if (effect->sessionId() == AUDIO_SESSION_OUTPUT_MIX) {
                     thread->mAudioFlinger->onNonOffloadableGlobalEffectEnable();
                 }
+            }
+            if ((thread->type() == ThreadBase::OFFLOAD) && (AudioSystem::getDeviceConnectionState(AUDIO_DEVICE_OUT_PROXY, "")
+                == AUDIO_POLICY_DEVICE_STATE_AVAILABLE) && (memcmp (&effect->mDescriptor.uuid, &IID_VISUALIZER,
+                sizeof (effect_uuid_t)) == 0)) {
+                PlaybackThread *t = (PlaybackThread *)thread.get();
+                t->invalidateTracks(AUDIO_STREAM_MUSIC);
             }
         }
     }
@@ -1697,7 +1713,9 @@ status_t AudioFlinger::EffectHandle::disable()
     sp<ThreadBase> thread = effect->thread().promote();
     if (thread != 0) {
         thread->checkSuspendOnEffectEnabled(effect, false, effect->sessionId());
-        if (thread->type() == ThreadBase::OFFLOAD || thread->type() == ThreadBase::MMAP) {
+        if (thread->type() == ThreadBase::OFFLOAD ||
+            thread->type() == ThreadBase::MMAP ||
+            thread->type() == ThreadBase::DIRECT) {
             Mutex::Autolock _l(thread->mLock);
             thread->broadcast_l();
         }
@@ -2055,7 +2073,8 @@ void AudioFlinger::EffectChain::process_l()
     // - on an OFFLOAD thread
     // - no more tracks are on the session and the effect tail has been rendered
     bool doProcess = (thread->type() != ThreadBase::OFFLOAD)
-                  && (thread->type() != ThreadBase::MMAP);
+                  && (thread->type() != ThreadBase::MMAP)
+                  && (thread->type() != ThreadBase::DIRECT);
     if (!isGlobalSession) {
         bool tracksOnSession = (trackCnt() != 0);
 
@@ -2313,6 +2332,13 @@ void AudioFlinger::EffectChain::setAudioSource_l(audio_source_t source)
     for (size_t i = 0; i < size; i++) {
         mEffects[i]->setAudioSource(source);
     }
+}
+
+bool AudioFlinger::EffectChain::hasVolumeControlEnabled_l() const {
+    for (const auto &effect : mEffects) {
+        if (effect->isVolumeControlEnabled()) return true;
+    }
+    return false;
 }
 
 // setVolume_l() must be called with ThreadBase::mLock or EffectChain::mLock held

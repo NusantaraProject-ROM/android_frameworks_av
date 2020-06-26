@@ -34,6 +34,7 @@
 #include <media/IAudioFlinger.h>
 #include <media/MediaAnalyticsItem.h>
 #include <media/TypeConverter.h>
+#include <media/SeempLog.h>
 
 #define WAIT_PERIOD_MS          10
 
@@ -352,7 +353,12 @@ status_t AudioRecord::set(
 
     mUserData = user;
     // TODO: add audio hardware input latency here
-    mLatency = (1000LL * mFrameCount) / mSampleRate;
+    if (mTransfer == TRANSFER_CALLBACK ||
+            mTransfer == TRANSFER_SYNC) {
+        mLatency = (1000 * mNotificationFramesAct) / mSampleRate;
+    } else {
+        mLatency = (1000 * mFrameCount) / mSampleRate;
+    }
     mMarkerPosition = 0;
     mMarkerReached = false;
     mNewPosition = 0;
@@ -377,6 +383,7 @@ exit:
 status_t AudioRecord::start(AudioSystem::sync_event_t event, audio_session_t triggerSession)
 {
     ALOGV("%s(%d): sync event %d trigger session %d", __func__, mPortId, event, triggerSession);
+    SEEMPLOG_RECORD(71,"");
 
     AutoMutex lock(mLock);
     if (mActive) {

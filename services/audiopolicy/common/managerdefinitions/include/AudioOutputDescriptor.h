@@ -180,6 +180,7 @@ public:
      * Active ref count of the client will be incremented/decremented through setActive API
      */
     virtual void setClientActive(const sp<TrackClientDescriptor>& client, bool active);
+    bool isClientActive(const sp<TrackClientDescriptor>& client);
 
     bool isActive(uint32_t inPastMs) const;
     bool isActive(VolumeSource volumeSource = VOLUME_SOURCE_NONE,
@@ -261,6 +262,7 @@ public:
                                   product_strategy_t strategy = PRODUCT_STRATEGY_NONE,
                                   bool preferredDeviceOnly = false) const;
 
+    audio_io_handle_t mIoHandle;           // output handle
     // override ClientMapHandler to abort when removing a client when active.
     void removeClient(audio_port_handle_t portId) override {
         auto client = getClient(portId);
@@ -387,7 +389,6 @@ public:
     DeviceVector filterSupportedDevices(const DeviceVector &devices) const;
 
     const sp<IOProfile> mProfile;          // I/O profile this output derives from
-    audio_io_handle_t mIoHandle;           // output handle
     uint32_t mLatency;                  //
     audio_output_flags_t mFlags;   //
     sp<SwAudioOutputDescriptor> mOutput1;    // used by duplicated outputs: first output
@@ -475,6 +476,11 @@ public:
      * returns the A2DP output handle if it is open or 0 otherwise
      */
     audio_io_handle_t getA2dpOutput() const;
+
+    /**
+     * return true if primary HAL supports A2DP Playback
+     */
+    bool isA2dpOnPrimary() const;
 
     /**
      * returns true if primary HAL supports A2DP Offload

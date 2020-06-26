@@ -34,7 +34,7 @@ cc_library_shared {
     stubs: {
         symbol_file: "libmediametrics.map.txt",
         versions: [
-            "1" ,
+           "1" ,
         ]
     },
 }

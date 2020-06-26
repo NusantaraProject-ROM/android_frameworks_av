@@ -66,6 +66,9 @@ namespace android {
 // media / notification / system volume.
 constexpr float IN_CALL_EARPIECE_HEADROOM_DB = 3.f;
 
+static const unsigned int DEFAULT_MUTE_LATENCY_FACTOR = 2;
+static const unsigned int DEFAULT_ROUTING_LATENCY_MS = 50;
+
 // Compressed formats for MSD module, ordered from most preferred to least preferred.
 static const std::vector<audio_format_t> compressedFormatsOrder = {{
         AUDIO_FORMAT_MAT_2_1, AUDIO_FORMAT_MAT_2_0, AUDIO_FORMAT_E_AC3,
@@ -475,6 +478,10 @@ status_t AudioPolicyManager::getHwOffloadEncodingFormatsSupportedForA2DP(
     std::unordered_set<audio_format_t> formatSet;
     sp<HwModule> primaryModule =
             mHwModules.getModuleFromName(AUDIO_HARDWARE_MODULE_ID_PRIMARY);
+    if (primaryModule == nullptr) {
+        ALOGE("%s() unable to get primary module", __func__);
+        return NO_INIT;
+    }
     DeviceVector declaredDevices = primaryModule->getDeclaredDevices().getDevicesFromTypeMask(
             AUDIO_DEVICE_OUT_ALL_A2DP);
     for (const auto& device : declaredDevices) {
@@ -839,7 +846,7 @@ sp<IOProfile> AudioPolicyManager::getProfileForOutput(
         // if explicitly requested
         static const uint32_t kRelevantFlags =
                 (AUDIO_OUTPUT_FLAG_HW_AV_SYNC | AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD |
-                 AUDIO_OUTPUT_FLAG_VOIP_RX);
+                 AUDIO_OUTPUT_FLAG_VOIP_RX | AUDIO_OUTPUT_FLAG_MMAP_NOIRQ);
         flags =
             (audio_output_flags_t)((flags & kRelevantFlags) | AUDIO_OUTPUT_FLAG_DIRECT);
     }
@@ -864,9 +871,10 @@ sp<IOProfile> AudioPolicyManager::getProfileForOutput(
                 continue;
             }
             if (!directOnly) return curProfile;
-            // when searching for direct outputs, if several profiles are compatible, give priority
-            // to one with offload capability
-            if (profile != 0 && ((curProfile->getFlags() & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) == 0)) {
+            // if several profiles are compatible, give priority to one with offload capability
+            // exact match is also not skipped as it should be preferred over any existing selection
+            if (profile != 0 && ((curProfile->getFlags() & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) == 0) &&
+               (curProfile->getFlags() != flags)) {
                 continue;
             }
             profile = curProfile;
@@ -889,7 +897,16 @@ audio_io_handle_t AudioPolicyManager::getOutput(audio_stream_type_t stream)
     // and AudioSystem::getOutputSamplingRate().
 
     SortedVector<audio_io_handle_t> outputs = getOutputsForDevices(devices, mOutputs);
-    const audio_io_handle_t output = selectOutput(outputs);
+
+    audio_io_handle_t output;
+    if (stream == AUDIO_STREAM_MUSIC  &&
+            property_get_bool("audio.deep_buffer.media", false /* default_value */)) {
+        // use DEEP_BUFFER as default output for music stream type
+         output = selectOutput(outputs, AUDIO_OUTPUT_FLAG_DEEP_BUFFER, AUDIO_FORMAT_INVALID);
+    }
+    else{
+          output = selectOutput(outputs);
+    }
 
     ALOGV("getOutput() stream %d selected devices %s, output %d", stream,
           devices.toString().c_str(), output);
@@ -1160,8 +1177,8 @@ audio_io_handle_t AudioPolicyManager::getOutputForDevices(
         goto non_direct_output;
     }
 
-    // Do not allow offloading if one non offloadable effect is enabled or MasterMono is enabled.
-    // This prevents creating an offloaded track and tearing it down immediately after start
+    // Do not allow Direct Output if one non offloadable effect is enabled or MasterMono is enabled.
+    // This prevents creating an direct track and tearing it down immediately after start
     // when audioflinger detects there is an active non offloadable effect.
     // FIXME: We should check the audio session here but we do not have it in this context.
     // This may prevent offloading in rare situations where effects are left active by apps
@@ -1189,7 +1206,7 @@ audio_io_handle_t AudioPolicyManager::getOutputForDevices(
                     (channelMask == desc->mChannelMask) &&
                     (session == desc->mDirectClientSession)) {
                     desc->mDirectOpenCount++;
-                    ALOGI("%s reusing direct output %d for session %d", __func__, 
+                    ALOGI("%s reusing direct output %d for session %d", __func__,
                         mOutputs.keyAt(i), session);
                     return mOutputs.keyAt(i);
                 }
@@ -1895,6 +1912,12 @@ void AudioPolicyManager::releaseOutput(audio_port_handle_t portId)
 
     ALOGV("releaseOutput() %d", outputDesc->mIoHandle);
 
+    sp<TrackClientDescriptor> client = outputDesc->getClient(portId);
+    if (outputDesc->isClientActive(client)) {
+        ALOGW("releaseOutput() inactivates portId %d in good faith", portId);
+        stopOutput(portId);
+    }
+
     if (outputDesc->mFlags & AUDIO_OUTPUT_FLAG_DIRECT) {
         if (outputDesc->mDirectOpenCount <= 0) {
             ALOGW("releaseOutput() invalid open count %d for output %d",
@@ -1906,9 +1929,7 @@ void AudioPolicyManager::releaseOutput(audio_port_handle_t portId)
             mpClientInterface->onAudioPortListUpdate();
         }
     }
-    // stopOutput() needs to be successfully called before releaseOutput()
-    // otherwise there may be inaccurate stream reference counts.
-    // This is checked in outputDesc->removeClient below.
+
     outputDesc->removeClient(portId);
 }
 
@@ -1947,7 +1968,7 @@ status_t AudioPolicyManager::getInputForAttr(const audio_attributes_t *attr,
     }
 
     // Explicit routing?
-    sp<DeviceDescriptor> explicitRoutingDevice = 
+    sp<DeviceDescriptor> explicitRoutingDevice =
             mAvailableInputDevices.getDeviceFromId(*selectedDeviceId);
 
     // special case for mmap capture: if an input IO handle is specified, we reuse this input if
@@ -2129,7 +2150,7 @@ audio_io_handle_t AudioPolicyManager::getInputForDevice(const sp<DeviceDescripto
             profileFlags = AUDIO_INPUT_FLAG_NONE; // retry
         } else { // fail
             ALOGW("%s could not find profile for device %s, sampling rate %u, format %#x, "
-                  "channel mask 0x%X, flags %#x", __func__, device->toString().c_str(), 
+                  "channel mask 0x%X, flags %#x", __func__, device->toString().c_str(),
                   config->sample_rate, config->format, config->channel_mask, flags);
             return input;
         }
@@ -2665,9 +2686,10 @@ audio_io_handle_t AudioPolicyManager::selectOutputForMusicEffects()
     // 1: An offloaded output. If the effect ends up not being offloadable,
     //    AudioFlinger will invalidate the track and the offloaded output
     //    will be closed causing the effect to be moved to a PCM output.
-    // 2: A deep buffer output
-    // 3: The primary output
-    // 4: the first output in the list
+    // 2: Non offloaded Direct output
+    // 3: A deep buffer output
+    // 4: The primary output
+    // 5: the first output in the list
 
     DeviceVector devices = mEngine->getOutputDevicesForAttributes(
                 attributes_initializer(AUDIO_USAGE_MEDIA), nullptr, false /*fromCache*/);
@@ -2682,6 +2704,7 @@ audio_io_handle_t AudioPolicyManager::selectOutputForMusicEffects()
 
     while (output == AUDIO_IO_HANDLE_NONE) {
         audio_io_handle_t outputOffloaded = AUDIO_IO_HANDLE_NONE;
+        audio_io_handle_t outputDirect = AUDIO_IO_HANDLE_NONE;
         audio_io_handle_t outputDeepBuffer = AUDIO_IO_HANDLE_NONE;
         audio_io_handle_t outputPrimary = AUDIO_IO_HANDLE_NONE;
 
@@ -2695,6 +2718,9 @@ audio_io_handle_t AudioPolicyManager::selectOutputForMusicEffects()
             if ((desc->mFlags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) != 0) {
                 outputOffloaded = output;
             }
+            if ((desc->mFlags == AUDIO_OUTPUT_FLAG_DIRECT) != 0) {
+                outputDirect = output;
+            }
             if ((desc->mFlags & AUDIO_OUTPUT_FLAG_DEEP_BUFFER) != 0) {
                 outputDeepBuffer = output;
             }
@@ -2704,7 +2730,9 @@ audio_io_handle_t AudioPolicyManager::selectOutputForMusicEffects()
         }
         if (outputOffloaded != AUDIO_IO_HANDLE_NONE) {
             output = outputOffloaded;
-        } else if (outputDeepBuffer != AUDIO_IO_HANDLE_NONE) {
+        } else if (outputDirect != AUDIO_IO_HANDLE_NONE) {
+            output = outputDirect;
+        }  else if (outputDeepBuffer != AUDIO_IO_HANDLE_NONE) {
             output = outputDeepBuffer;
         } else if (outputPrimary != AUDIO_IO_HANDLE_NONE) {
             output = outputPrimary;
@@ -3975,7 +4003,8 @@ status_t AudioPolicyManager::setMasterMono(bool mono)
         Vector<audio_io_handle_t> offloaded;
         for (size_t i = 0; i < mOutputs.size(); ++i) {
             sp<SwAudioOutputDescriptor> desc = mOutputs.valueAt(i);
-            if (desc->mFlags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD) {
+            if (desc->mFlags & AUDIO_OUTPUT_FLAG_COMPRESS_OFFLOAD ||
+                desc->mFlags == AUDIO_OUTPUT_FLAG_DIRECT) {
                 offloaded.push(desc->mIoHandle);
             }
         }
@@ -4234,7 +4263,7 @@ uint32_t AudioPolicyManager::nextAudioPortGeneration()
 
 // Treblized audio policy xml config will be located in /odm/etc or /vendor/etc.
 static const char *kConfigLocationList[] =
-        {"/odm/etc", "/vendor/etc", "/system/etc"};
+        {"/odm/etc", "/vendor/etc/audio", "/vendor/etc", "/system/etc"};
 static const int kConfigLocationListSize =
         (sizeof(kConfigLocationList) / sizeof(kConfigLocationList[0]));
 
@@ -4840,7 +4869,7 @@ status_t AudioPolicyManager::checkInputsForDevice(const sp<DeviceDescriptor>& de
             } // endif input != 0
 
             if (input == AUDIO_IO_HANDLE_NONE) {
-                ALOGW("%s could not open input for device %s", __func__,  
+                ALOGW("%s could not open input for device %s", __func__,
                        device->toString().c_str());
                 profiles.removeAt(profile_index);
                 profile_index--;
@@ -5027,6 +5056,12 @@ bool AudioPolicyManager::followsSameRouting(const audio_attributes_t &lAttr,
             mEngine->getProductStrategyForAttributes(rAttr);
 }
 
+const unsigned int muteLatencyFactor = property_get_int32(
+            "audio.sys.mute.latency.factor", DEFAULT_MUTE_LATENCY_FACTOR);
+
+const unsigned int routingLatency = property_get_int32(
+            "audio.sys.routing.latency", DEFAULT_ROUTING_LATENCY_MS);
+
 void AudioPolicyManager::checkOutputForAttributes(const audio_attributes_t &attr)
 {
     auto psId = mEngine->getProductStrategyForAttributes(attr);
@@ -5058,6 +5093,8 @@ void AudioPolicyManager::checkOutputForAttributes(const audio_attributes_t &attr
         // get maximum latency of all source outputs to determine the minimum mute time guaranteeing
         // audio from invalidated tracks will be rendered when unmuting
         uint32_t maxLatency = 0;
+        // factor to increase mute duration in case track is invalidated
+        uint32_t invalidationFactor = 1;
         for (audio_io_handle_t srcOut : srcOutputs) {
             sp<SwAudioOutputDescriptor> desc = mPreviousOutputs.valueFor(srcOut);
             if (desc != 0 && maxLatency < desc->latency()) {
@@ -5073,8 +5110,6 @@ void AudioPolicyManager::checkOutputForAttributes(const audio_attributes_t &attr
             sp<SwAudioOutputDescriptor> desc = mPreviousOutputs.valueFor(srcOut);
             if (desc != 0 && desc->isStrategyActive(psId)) {
                 setStrategyMute(psId, true, desc);
-                setStrategyMute(psId, false, desc, maxLatency * LATENCY_MUTE_FACTOR,
-                                newDevices.types());
             }
             sp<SourceClientDescriptor> source = getSourceForAttributesOnOutput(srcOut, attr);
             if (source != 0){
@@ -5088,7 +5123,24 @@ void AudioPolicyManager::checkOutputForAttributes(const audio_attributes_t &attr
         }
         // Move tracks associated to this stream (and linked) from previous output to new output
         for (auto stream :  mEngine->getStreamTypesForProductStrategy(psId)) {
+            // Do not invalidate stream if new music output and previous music output are same
+            sp<SwAudioOutputDescriptor> desc;
+            if (stream == AUDIO_STREAM_MUSIC &&
+                   ((desc = mPreviousOutputs.valueFor(mMusicEffectOutput)) != 0) &&
+                   desc->supportsAllDevices(newDevices) &&
+                   desc->isActive(toVolumeSource(AUDIO_STREAM_MUSIC)))
+                continue;
             mpClientInterface->invalidateStream(stream);
+            if (isStreamActive(stream, 0) && invalidationFactor == 1)
+                invalidationFactor = 2;
+        }
+
+        for (audio_io_handle_t srcOut : srcOutputs) {
+            sp<SwAudioOutputDescriptor> desc = mPreviousOutputs.valueFor(srcOut);
+            if (desc != 0 && desc->isStrategyActive(psId))
+                setStrategyMute(psId, false, desc,
+                            (maxLatency * muteLatencyFactor * invalidationFactor)
+                             + routingLatency, newDevices.types());
         }
     }
 }
@@ -5127,6 +5179,7 @@ void AudioPolicyManager::checkSecondaryOutputs() {
 void AudioPolicyManager::checkA2dpSuspend()
 {
     audio_io_handle_t a2dpOutput = mOutputs.getA2dpOutput();
+
     if (a2dpOutput == 0 || mOutputs.isA2dpOffloadedOnPrimary()) {
         mA2dpSuspended = false;
         return;
@@ -5138,11 +5191,13 @@ void AudioPolicyManager::checkA2dpSuspend()
             ((mAvailableOutputDevices.types() & AUDIO_DEVICE_OUT_ALL_SCO) != 0);
 
     // if suspended, restore A2DP output if:
+    //      (A2DP output is present and not on primary output) &&
     //      ((SCO device is NOT connected) ||
     //       ((forced usage communication is NOT SCO) && (forced usage for record is NOT SCO) &&
     //        (phone state is NOT in call) && (phone state is NOT ringing)))
     //
     // if not suspended, suspend A2DP output if:
+    //      (A2DP output is present and not on primary output) &&
     //      (SCO device is connected) &&
     //       ((forced usage for communication is SCO) || (forced usage for record is SCO) ||
     //       ((phone state is in call) || (phone state is ringing)))
@@ -5155,8 +5210,7 @@ void AudioPolicyManager::checkA2dpSuspend()
                       AUDIO_POLICY_FORCE_BT_SCO) &&
               (mEngine->getPhoneState() != AUDIO_MODE_IN_CALL) &&
               (mEngine->getPhoneState() != AUDIO_MODE_RINGTONE))) {
-
-            mpClientInterface->restoreOutput(a2dpOutput);
+                mpClientInterface->restoreOutput(a2dpOutput);
             mA2dpSuspended = false;
         }
     } else {
@@ -5167,8 +5221,7 @@ void AudioPolicyManager::checkA2dpSuspend()
                       AUDIO_POLICY_FORCE_BT_SCO) ||
               (mEngine->getPhoneState() == AUDIO_MODE_IN_CALL) ||
               (mEngine->getPhoneState() == AUDIO_MODE_RINGTONE))) {
-
-            mpClientInterface->suspendOutput(a2dpOutput);
+                mpClientInterface->suspendOutput(a2dpOutput);
             mA2dpSuspended = true;
         }
     }
@@ -5210,8 +5263,10 @@ DeviceVector AudioPolicyManager::getNewOutputDevices(const sp<SwAudioOutputDescr
         auto attr = mEngine->getAllAttributesForProductStrategy(productStrategy).front();
 
         if ((hasVoiceStream(streams) &&
+             (outputDesc->isActive(toVolumeSource(AUDIO_STREAM_VOICE_CALL)) || outputDesc == mPrimaryOutput) &&
              (isInCall() || mOutputs.isStrategyActiveOnSameModule(productStrategy, outputDesc))) ||
-             ((hasStream(streams, AUDIO_STREAM_ALARM) || hasStream(streams, AUDIO_STREAM_ENFORCED_AUDIBLE)) &&
+             (((hasStream(streams, AUDIO_STREAM_ALARM) && isStreamActive(AUDIO_STREAM_ALARM, 0)) ||
+               (hasStream(streams, AUDIO_STREAM_ENFORCED_AUDIBLE) && isStreamActive(AUDIO_STREAM_ENFORCED_AUDIBLE, 0))) &&
                 mOutputs.isStrategyActiveOnSameModule(productStrategy, outputDesc)) ||
                 outputDesc->isStrategyActive(productStrategy)) {
             // Retrieval of devices for voice DL is done on primary output profile, cannot
@@ -5250,7 +5305,12 @@ sp<DeviceDescriptor> AudioPolicyManager::getNewInputDevice(
     // If we are not in call and no client is active on this input, this methods returns
     // a null sp<>, causing the patch on the input stream to be released.
     audio_attributes_t attributes = inputDesc->getHighestPriorityAttributes();
-    if (attributes.source == AUDIO_SOURCE_DEFAULT && isInCall()) {
+
+    // Check for source AUDIO_SOURCE_VOICE_UPLINK when in call.
+    // Device switch during in call record use case returns built-in mic
+    // as new device which is not supported on primary input.
+    // Avoid this by retrieving device based on highest priority source.
+    if ((attributes.source == AUDIO_SOURCE_DEFAULT || attributes.source != AUDIO_SOURCE_VOICE_UPLINK) && isInCall()) {
         attributes.source = AUDIO_SOURCE_VOICE_COMMUNICATION;
     }
     if (attributes.source != AUDIO_SOURCE_DEFAULT) {
@@ -5440,9 +5500,11 @@ uint32_t AudioPolicyManager::checkDeviceMuteStrategies(const sp<AudioOutputDescr
     // temporary mute output if device selection changes to avoid volume bursts due to
     // different per device volumes
     if (outputDesc->isActive() && (devices != prevDevices)) {
-        uint32_t tempMuteWaitMs = outputDesc->latency() * 2;
-        // temporary mute duration is conservatively set to 4 times the reported latency
-        uint32_t tempMuteDurationMs = outputDesc->latency() * 4;
+        uint32_t tempMuteWaitMs = outputDesc->latency() * muteLatencyFactor;
+        // temporary mute duration can be configured by altering audio.sys.mute.latency.factor
+        // and audio.sys.routing.latency
+        uint32_t tempMuteDurationMs =
+                (outputDesc->latency() * muteLatencyFactor) + routingLatency;
         if (muteWaitMs < tempMuteWaitMs) {
             muteWaitMs = tempMuteWaitMs;
         }
@@ -5643,6 +5705,11 @@ sp<IOProfile> AudioPolicyManager::getInputProfile(const sp<DeviceDescriptor> &de
         for (const auto& profile : hwModule->getInputProfiles()) {
             // profile->log();
             //updatedFormat = format;
+            // Choose the input profile based on this priority:
+            // 1. exact match with both channel mask and format
+            // 2. exact match with channel mask and best match with format
+            // 3. exact match with format and best match with channel mask
+            // 4. best match with both channel mask and format
             if (profile->isCompatibleProfile(DeviceVector(device), samplingRate,
                                              &samplingRate  /*updatedSamplingRate*/,
                                              format,
@@ -5651,7 +5718,10 @@ sp<IOProfile> AudioPolicyManager::getInputProfile(const sp<DeviceDescriptor> &de
                                              &channelMask   /*updatedChannelMask*/,
                                              // FIXME ugly cast
                                              (audio_output_flags_t) flags,
-                                             true /*exactMatchRequiredForInputFlags*/)) {
+                                             true /*exactMatchRequiredForInputFlags*/,
+                                             true,
+                                             true)) {
+
                 return profile;
             }
             if (firstInexact == nullptr && profile->isCompatibleProfile(DeviceVector(device),
@@ -5663,12 +5733,42 @@ sp<IOProfile> AudioPolicyManager::getInputProfile(const sp<DeviceDescriptor> &de
                                              &updatedChannelMask,
                                              // FIXME ugly cast
                                              (audio_output_flags_t) flags,
-                                             false /*exactMatchRequiredForInputFlags*/)) {
+                                             false /*exactMatchRequiredForInputFlags*/,
+                                             false,
+                                             true)) {
                 firstInexact = profile;
             }
-
+            if (firstInexact == nullptr && profile->isCompatibleProfile(DeviceVector(device),
+                                             samplingRate,
+                                             &updatedSamplingRate,
+                                             format,
+                                             &updatedFormat,
+                                             channelMask,
+                                             &updatedChannelMask,
+                                             // FIXME ugly cast
+                                             (audio_output_flags_t) flags,
+                                             false /*exactMatchRequiredForInputFlags*/,
+                                             true,
+                                             false)) {
+                firstInexact = profile;
+            }
+            if (firstInexact == nullptr && profile->isCompatibleProfile(DeviceVector(device),
+                                             samplingRate,
+                                             &updatedSamplingRate,
+                                             format,
+                                             &updatedFormat,
+                                             channelMask,
+                                             &updatedChannelMask,
+                                             // FIXME ugly cast
+                                             (audio_output_flags_t) flags,
+                                             false /*exactMatchRequiredForInputFlags*/,
+                                             false,
+                                             false)) {
+                firstInexact = profile;
+            }
         }
     }
+
     if (firstInexact != nullptr) {
         samplingRate = updatedSamplingRate;
         format = updatedFormat;

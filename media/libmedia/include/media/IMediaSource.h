@@ -30,6 +30,7 @@ namespace android {
 
 class MediaBufferGroup;
 
+
 class IMediaSource : public IInterface {
 public:
     DECLARE_META_INTERFACE(MediaSource);

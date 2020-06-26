@@ -606,9 +606,6 @@ ssize_t Camera3Device::getJpegBufferSize(uint32_t width, uint32_t height) const 
             (maxJpegResolution.width * maxJpegResolution.height);
     ssize_t jpegBufferSize = scaleFactor * (maxJpegBufferSize - kMinJpegBufferSize) +
             kMinJpegBufferSize;
-    if (jpegBufferSize > maxJpegBufferSize) {
-        jpegBufferSize = maxJpegBufferSize;
-    }
 
     return jpegBufferSize;
 }
@@ -2153,6 +2150,15 @@ status_t Camera3Device::waitUntilDrainedLocked(nsecs_t maxExpectedDuration) {
     if (res != OK) {
         SET_ERR_L("Error waiting for HAL to drain: %s (%d)", strerror(-res),
                 res);
+        if (res == TIMED_OUT) {
+            for (size_t i = 0; i < mInFlightMap.size(); i++) {
+                InFlightRequest r = mInFlightMap.valueAt(i);
+                ALOGE("%s: Timed out Frame %d Timestamp: %" PRId64 ",  metadata"
+                    " arrived: %s, buffers left: %d\n", __FUNCTION__, mInFlightMap.keyAt(i),
+                        r.shutterTimestamp, r.haveResultMetadata ? "true" : "false",
+                        r.numBuffersLeft);
+            }
+        }
     }
     return res;
 }
@@ -5113,9 +5119,15 @@ status_t Camera3Device::RequestThread::clear(
 
 status_t Camera3Device::RequestThread::flush() {
     ATRACE_CALL();
+    status_t flush_status;
     Mutex::Autolock l(mFlushLock);
 
-    return mInterface->flush();
+    flush_status = mInterface->flush();
+    // We have completed flush, signal RequestThread::waitForNextRequestLocked() to no longer wait for
+    // new requests
+    mRequestSignal.signal();
+
+    return flush_status;
 }
 
 void Camera3Device::RequestThread::setPaused(bool paused) {

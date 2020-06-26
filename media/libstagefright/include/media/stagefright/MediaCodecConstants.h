@@ -67,6 +67,8 @@ constexpr int32_t AVCLevel6       = 0x20000;
 constexpr int32_t AVCLevel61      = 0x40000;
 constexpr int32_t AVCLevel62      = 0x80000;
 
+// TODO (b/123906046) This is a dead codepath from q-fs-release merge; ideally
+// the deviation is further reduced such that becomes a live code path.
 inline static const char *asString_AVCLevel(int32_t i, const char *def = "??") {
     switch (i) {
         case AVCLevel1:     return "1";
