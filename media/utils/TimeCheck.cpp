@@ -20,6 +20,7 @@
 #include <media/TimeCheck.h>
 #include <media/EventLog.h>
 #include <cutils/properties.h>
+#include "debuggerd/handler.h"
 
 namespace android {
 
