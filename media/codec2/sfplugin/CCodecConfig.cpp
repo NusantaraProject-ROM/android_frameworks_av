@@ -1133,6 +1133,12 @@ bool CCodecConfig::updateConfiguration(
             insertion.first->second = std::move(p);
         }
     }
+    if (mInputSurface
+            && (domain & mOutputDomain)
+            && mInputSurfaceDataspace != mInputSurface->getDataspace()) {
+        changed = true;
+        mInputSurfaceDataspace = mInputSurface->getDataspace();
+    }
 
     ALOGV("updated configuration has %zu params (%s)", mCurrentConfig.size(),
             changed ? "CHANGED" : "no change");
@@ -1364,7 +1370,6 @@ sp<AMessage> CCodecConfig::getFormatForDomain(
             msg->removeEntryAt(msg->findEntryByName("color-matrix"));
         }
 
-
         // calculate dataspace for raw graphic buffers if not specified by component, or if
         // using surface with unspecified aspects (as those must be defaulted which may change
         // the dataspace)
@@ -1400,6 +1405,23 @@ sp<AMessage> CCodecConfig::getFormatForDomain(
                 dataspace = ColorUtils::getDataSpaceForColorAspects(aspects, true /* mayExpand */);
                 msg->setInt32("android._dataspace", dataspace);
             }
+        }
+
+        if (mInputSurface) {
+            android_dataspace dataspace = mInputSurface->getDataspace();
+            ColorUtils::convertDataSpaceToV0(dataspace);
+            int32_t standard;
+            ColorUtils::getColorConfigFromDataSpace(dataspace, &range, &standard, &transfer);
+            if (range != 0) {
+                msg->setInt32(KEY_COLOR_RANGE, range);
+            }
+            if (standard != 0) {
+                msg->setInt32(KEY_COLOR_STANDARD, standard);
+            }
+            if (transfer != 0) {
+                msg->setInt32(KEY_COLOR_TRANSFER, transfer);
+            }
+            msg->setInt32("android._dataspace", dataspace);
         }
 
         // HDR static info
