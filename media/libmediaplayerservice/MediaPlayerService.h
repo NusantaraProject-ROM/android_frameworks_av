@@ -1,6 +1,6 @@
 /*
 **
-** Copyright 2008, The Android Open Source Project
+** Copyright 2008-2021, The Android Open Source Project
 **
 ** Licensed under the Apache License, Version 2.0 (the "License");
 ** you may not use this file except in compliance with the License.
@@ -242,6 +242,7 @@ public:
                                        const std::string opPackageName);
 
     virtual sp<IMediaCodecList> getCodecList() const;
+    virtual sp<IHDCP>           makeHDCP(bool createEncryptionModule);
 
     virtual sp<IRemoteDisplay> listenForRemoteDisplay(const String16 &opPackageName,
             const sp<IRemoteDisplayClient>& client, const String8& iface);
